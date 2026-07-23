@@ -13,9 +13,10 @@ services:
     # here. Values come from the host environment / sibling `.env`. Defaults match
     # server.py; the required secret has none and must be provided.
     environment:
-      PARCEL_URL: ${PARCEL_URL:-https://api.parcel.app/external/deliveries/}
+      PARCEL_API_BASE: ${PARCEL_API_BASE:-https://api.parcel.app/external}
       PARCEL_API_KEY: ${PARCEL_API_KEY:?PARCEL_API_KEY is required}
       DEFAULT_FILTER_MODE: ${DEFAULT_FILTER_MODE:-active}
+      READ_ONLY: ${READ_ONLY:-false}
       PARCEL_TIMEOUT: ${PARCEL_TIMEOUT:-15}
       STARTUP_TEST: ${STARTUP_TEST:-false}
       REQUIRE_POMERIUM_IDENTITY: ${REQUIRE_POMERIUM_IDENTITY:-false}
