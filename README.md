@@ -1,1 +1,166 @@
 # Parcel-API-MCP
+
+A minimal, self-hosted [MCP](https://modelcontextprotocol.io) server that exposes a
+single `get_deliveries` tool. It reads your tracked package deliveries from the
+[Parcel](https://parcelapp.net) app's "view deliveries" API. The tool is served over
+the streamable-HTTP MCP transport at `/mcp`, with an unauthenticated `/healthz`
+liveness route. The implementation is intentionally tiny (one authenticated `GET`) to
+keep the audit/attack surface small.
+
+## ⚠️ Security requirement: this server MUST be gated by an authorization service
+
+**This server implements no authentication of its own, by design.** Anyone who can reach
+`/mcp` can read your deliveries. **Do not expose it directly to the internet or bind it
+to a public port.**
+
+It **must** sit behind an identity-aware authorization proxy — such as
+**[Pomerium](https://www.pomerium.com/docs/capabilities/mcp) in MCP mode**, or an
+equivalent like [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/)
+or [oauth2-proxy](https://oauth2-proxy.github.io/oauth2-proxy/) — that authenticates and
+authorizes **every** request before it reaches `/mcp`.
+
+Reference topology:
+
+```
+edge tunnel → reverse proxy (TLS) → Pomerium (SSO + allowlist to a single identity) → parcel-api-mcp
+                                                                                        (internal network only)
+```
+
+The provided `docker-compose.yml` deliberately publishes **no host ports** and attaches
+the container only to the proxy's internal Docker network, so the server is unreachable
+except through the authorization proxy.
+
+**Defense in depth already built in** (these complement, they do not replace, the proxy):
+
+- The tool is **read-only** — it only calls Parcel's "view deliveries" endpoint. It never
+  adds, edits, or deletes shipments, so a misused tool cannot change any state.
+- Setting `REQUIRE_POMERIUM_IDENTITY=true` makes the app **cryptographically verify**
+  Pomerium's identity assertion on every `/mcp` request — signature (against Pomerium's
+  JWKS), expiry, and audience. This blocks anything on the shared Docker network from
+  reaching the app directly and bypassing Pomerium. See
+  [Enabling app-layer verification](#enabling-app-layer-verification).
+
+## Configuration
+
+All configuration is via environment variables. Copy `.env.example` to `.env` and fill in
+real values. `.env` is git-ignored and must stay that way — it holds the Parcel API key.
+Nothing secret is baked into the image (the key is injected at runtime), which is why the
+published container image can safely be public.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `PARCEL_API_KEY` | — | Personal Parcel API key. Generate it in the Parcel web app (see below). |
+| `PARCEL_URL` | `https://api.parcel.app/external/deliveries/` | Parcel "view deliveries" endpoint. |
+| `DEFAULT_FILTER_MODE` | `active` | Filter when the tool's `filter_mode` is omitted: `active` (in-progress only) or `recent` (also recently delivered). |
+| `PARCEL_TIMEOUT` | `15` | Per-request network timeout (seconds). Keep it below the fronting proxy's gateway timeout. |
+| `STARTUP_TEST` | `false` | Call the Parcel API and count active deliveries on startup to verify the key. On failure, logs the reason; the server keeps running either way. |
+| `REQUIRE_POMERIUM_IDENTITY` | `false` | Verify Pomerium's identity assertion on every `/mcp` request (see below). Requires `POMERIUM_JWKS_URL`. |
+| `POMERIUM_JWKS_URL` | — | Pomerium's JWKS endpoint, e.g. `https://<host>/.well-known/pomerium/jwks.json`. Required when the gate is on. |
+| `POMERIUM_AUDIENCE` | — | Expected `aud` claim (the route host/URL). Verified when set — strongly recommended. |
+| `POMERIUM_ISSUER` | — | Expected `iss` claim. Verified only when set. |
+| `POMERIUM_IDENTITY_HEADER` | `x-pomerium-assertion,x-pomerium-jwt-assertion` | Comma-separated header(s) carrying the assertion JWT. |
+| `HOST` / `PORT` | `0.0.0.0` / `8080` | Server bind address/port. |
+
+### Getting a Parcel API key
+
+Open the Parcel web app at **[web.parcelapp.net](https://web.parcelapp.net)** → **Account
+→ API** and generate a key. Parcel rate-limits the key to **20 requests/hour** and caches
+results server-side, so a periodic caller (e.g. a once-a-day briefing) is well within
+budget — do not add tight polling.
+
+### The `get_deliveries` tool
+
+```
+get_deliveries(filter_mode?: str) -> str
+```
+
+Returns a JSON array of your tracked deliveries, sorted by soonest expected arrival. Each
+entry has `description`, `carrier_code`, `status_code`, `status_label`, `tracking_number`,
+`date_expected`, `date_expected_end`, `timestamp_expected`, and `latest_event`
+(event/date/location of the most recent scan, or `null`). `filter_mode` is `active`
+(in-progress only, the default) or `recent` (also includes recently delivered); it falls
+back to `DEFAULT_FILTER_MODE` when omitted.
+
+`status_code` maps to `status_label` as: `0` Delivered · `1` Frozen · `2` In transit ·
+`3` Awaiting pickup · `4` Out for delivery · `5` Not found · `6` Failed attempt ·
+`7` Exception · `8` Info received.
+
+## Enabling app-layer verification
+
+This step is **optional** — Pomerium already gates all access. Enable it only if you also
+want the app to reject any request that reaches it *without* a valid Pomerium identity
+(e.g. a compromised neighbor on the shared Docker network hitting `parcel-mcp:8080`
+directly). When on, the app verifies the assertion JWT's signature, expiry, and audience.
+
+**1. Pomerium — set these on the `parcel-mcp` route.** The critical addition is
+`pass_identity_headers: true`; without it Pomerium forwards no identity header and the app
+rejects every request. Pomerium must also have a **signing key** configured (it serves the
+matching public keys at `/.well-known/pomerium/jwks.json`).
+
+```yaml
+routes:
+  - from: https://parcel-mcp.example.com
+    to: http://parcel-mcp:8080         # pathless — the /mcp path passes through
+    name: parcel-mcp
+    mcp:
+      server: {}
+    pass_identity_headers: true        # <-- REQUIRED: sends X-Pomerium-Assertion to the app
+    policy:
+      - allow:
+          and:
+            - email:
+                is: you@example.com
+```
+
+**2. App — set these in `.env`:**
+
+```sh
+REQUIRE_POMERIUM_IDENTITY=true
+POMERIUM_JWKS_URL=https://parcel-mcp.example.com/.well-known/pomerium/jwks.json
+POMERIUM_AUDIENCE=parcel-mcp.example.com
+```
+
+Then `docker compose up -d`. If `REQUIRE_POMERIUM_IDENTITY=true` but `POMERIUM_JWKS_URL` is
+unset, the server refuses to start (a security gate must not run unable to verify). To turn
+the feature off again, set `REQUIRE_POMERIUM_IDENTITY=false`.
+
+## Run
+
+```sh
+cp .env.example .env      # then edit .env with real values
+docker compose up -d
+```
+
+Health check:
+
+```sh
+docker compose exec parcel-mcp \
+  python -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8080/healthz').read())"
+# -> b'ok'
+```
+
+Then add the `parcel-mcp` route to your authorization proxy (pathless upstream, e.g.
+`to: http://parcel-mcp:8080`, so the `/mcp` path passes through) and connect your MCP
+client to `https://<your-host>/mcp`.
+
+## Maintenance
+
+Patches flow with near-zero manual effort:
+
+- **Dependabot** (`.github/dependabot.yml`) watches `requirements.txt`, the Dockerfile base
+  image, and the workflow's actions, opening upgrade PRs weekly. Also enable Dependabot
+  **security updates** in the repo's Settings → Code security.
+- **CI** (`.github/workflows/build.yml`) builds and pushes the image to GHCR on push to
+  `main`, on Dependabot PRs, via manual dispatch, and **weekly (Mon 06:00 UTC) with
+  `no-cache`** so the OS and Python patches are genuinely refreshed even without code
+  changes.
+- On the host, pull the rebuilt image with [Watchtower](https://containrrr.dev/watchtower/)
+  (the compose file already sets the opt-in label) or a cron running
+  `docker compose pull && docker compose up -d`.
+
+## Links
+
+- Parcel — [view-deliveries API](https://parcelapp.net/help/api-view-deliveries.html)
+- Pomerium — [MCP support](https://www.pomerium.com/docs/capabilities/mcp)
+- Pomerium — [Protect an MCP server](https://www.pomerium.com/docs/capabilities/mcp/protect-mcp-server)
+- [Dependabot configuration options](https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file)

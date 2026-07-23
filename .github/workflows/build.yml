@@ -1,0 +1,58 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  # Build-only validation on PRs (e.g. Dependabot bumps) — no push to GHCR.
+  pull_request:
+  # Weekly rebuild with no cache so the base image + OS/Python patches are
+  # genuinely refreshed even when there are no code changes.
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Log in to GHCR
+        # No login on PRs — those builds don't push (and fork PRs lack the token).
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          # Push everywhere except PRs, where we only validate that the image builds.
+          push: ${{ github.event_name != 'pull_request' }}
+          # Refresh everything on the weekly scheduled rebuild.
+          no-cache: ${{ github.event_name == 'schedule' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
