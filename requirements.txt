@@ -1,0 +1,7 @@
+# Official MCP Python SDK (pulls in starlette + uvicorn used by server.py).
+# Loose lower bound so Dependabot can propose upgrades.
+mcp>=1.28.1
+# HTTP client used to call the Parcel "view deliveries" REST endpoint.
+httpx>=0.27.0
+# JWT verification of Pomerium's identity assertion (ES256 needs cryptography).
+pyjwt[crypto]>=2.13.0

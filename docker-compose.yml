@@ -1,0 +1,48 @@
+# Deploy compose. Every value is interpolated from the environment (Compose also
+# auto-loads a sibling `.env` for these `${...}` substitutions), so this file is
+# safe to publish — no secrets are hard-coded. The container is NEVER exposed on
+# a host port: it is reachable only from the proxy network, and an identity-aware
+# authorization proxy (e.g. Pomerium) must front it. See README.md.
+
+services:
+  parcel-mcp:
+    image: ${IMAGE:-ghcr.io/jb09/parcel-api-mcp:latest}
+    container_name: ${CONTAINER_NAME:-parcel-mcp}
+    restart: unless-stopped
+    # Each variable is set explicitly so exactly what the app receives is visible
+    # here. Values come from the host environment / sibling `.env`. Defaults match
+    # server.py; the required secret has none and must be provided.
+    environment:
+      PARCEL_URL: ${PARCEL_URL:-https://api.parcel.app/external/deliveries/}
+      PARCEL_API_KEY: ${PARCEL_API_KEY:?PARCEL_API_KEY is required}
+      DEFAULT_FILTER_MODE: ${DEFAULT_FILTER_MODE:-active}
+      PARCEL_TIMEOUT: ${PARCEL_TIMEOUT:-15}
+      STARTUP_TEST: ${STARTUP_TEST:-false}
+      REQUIRE_POMERIUM_IDENTITY: ${REQUIRE_POMERIUM_IDENTITY:-false}
+      POMERIUM_IDENTITY_HEADER: ${POMERIUM_IDENTITY_HEADER:-x-pomerium-assertion,x-pomerium-jwt-assertion}
+      POMERIUM_JWKS_URL: ${POMERIUM_JWKS_URL:-}
+      POMERIUM_AUDIENCE: ${POMERIUM_AUDIENCE:-}
+      POMERIUM_ISSUER: ${POMERIUM_ISSUER:-}
+    # No published `ports:` on purpose — do not bind a public interface. The
+    # authorization proxy reaches the server by container name over the internal
+    # `proxy` network below; the app listens on port 8080.
+    networks:
+      - proxy
+    labels:
+      # Opt in to Watchtower so weekly CI rebuilds are pulled automatically.
+      - "com.centurylinklabs.watchtower.enable=true"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz').read()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  proxy:
+    external: true
+    name: ${PROXY_NETWORK:-pomerium}
