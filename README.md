@@ -1,11 +1,20 @@
 # Parcel-API-MCP
 
-A minimal, self-hosted [MCP](https://modelcontextprotocol.io) server that exposes a
-single `get_deliveries` tool. It reads your tracked package deliveries from the
-[Parcel](https://parcelapp.net) app's "view deliveries" API. The tool is served over
-the streamable-HTTP MCP transport at `/mcp`, with an unauthenticated `/healthz`
-liveness route. The implementation is intentionally tiny (one authenticated `GET`) to
-keep the audit/attack surface small.
+A minimal, self-hosted [MCP](https://modelcontextprotocol.io) server for the
+[Parcel](https://parcelapp.net) app's package-tracking API. It exposes tools to list
+your deliveries, add a new one, look up carrier codes, and read the status-code map.
+The tools are served over the streamable-HTTP MCP transport at `/mcp`, with an
+unauthenticated `/healthz` liveness route. The implementation is intentionally small to
+keep the audit/attack surface tight.
+
+## Tools
+
+| Tool | Kind | Description |
+| --- | --- | --- |
+| `get_deliveries` | read | List tracked deliveries, sorted by soonest expected arrival. |
+| `add_delivery` | write | Add a package to Parcel tracking. Disabled when `READ_ONLY=true`. |
+| `get_supported_carriers` | read | List carriers and their `carrier_code` values (public endpoint). |
+| `get_delivery_status_codes` | read | Return the `status_code` → label map (local reference, no API call). |
 
 ## ⚠️ Security requirement: this server MUST be gated by an authorization service
 
@@ -32,8 +41,9 @@ except through the authorization proxy.
 
 **Defense in depth already built in** (these complement, they do not replace, the proxy):
 
-- The tool is **read-only** — it only calls Parcel's "view deliveries" endpoint. It never
-  adds, edits, or deletes shipments, so a misused tool cannot change any state.
+- The API is **read-mostly**: `get_deliveries` never mutates state, and the only writing
+  tool, `add_delivery`, can be turned off entirely with `READ_ONLY=true` — so a misused
+  tool cannot add shipments to your account. Parcel's API has no delete/edit surface.
 - Setting `REQUIRE_POMERIUM_IDENTITY=true` makes the app **cryptographically verify**
   Pomerium's identity assertion on every `/mcp` request — signature (against Pomerium's
   JWKS), expiry, and audience. This blocks anything on the shared Docker network from
@@ -49,9 +59,10 @@ published container image can safely be public.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `PARCEL_API_KEY` | — | Personal Parcel API key. Generate it in the Parcel web app (see below). |
-| `PARCEL_URL` | `https://api.parcel.app/external/deliveries/` | Parcel "view deliveries" endpoint. |
-| `DEFAULT_FILTER_MODE` | `active` | Filter when the tool's `filter_mode` is omitted: `active` (in-progress only) or `recent` (also recently delivered). |
+| `PARCEL_API_KEY` | — | Personal Parcel API key. Generate it in the Parcel web app (see below). Required for the delivery tools; the carrier list is public. |
+| `PARCEL_API_BASE` | `https://api.parcel.app/external` | Base URL; all endpoints are derived from it. Override only for a test double. |
+| `DEFAULT_FILTER_MODE` | `active` | Filter when `get_deliveries`'s `filter_mode` is omitted: `active` (in-progress only) or `recent` (also recently delivered). Parcel's own default is `recent`. |
+| `READ_ONLY` | `false` | When `true`, disable the `add_delivery` tool (read tools still work). |
 | `PARCEL_TIMEOUT` | `15` | Per-request network timeout (seconds). Keep it below the fronting proxy's gateway timeout. |
 | `STARTUP_TEST` | `false` | Call the Parcel API and count active deliveries on startup to verify the key. On failure, logs the reason; the server keeps running either way. |
 | `REQUIRE_POMERIUM_IDENTITY` | `false` | Verify Pomerium's identity assertion on every `/mcp` request (see below). Requires `POMERIUM_JWKS_URL`. |
@@ -68,7 +79,7 @@ Open the Parcel web app at **[web.parcelapp.net](https://web.parcelapp.net)** �
 results server-side, so a periodic caller (e.g. a once-a-day briefing) is well within
 budget — do not add tight polling.
 
-### The `get_deliveries` tool
+### Tools
 
 ```
 get_deliveries(filter_mode?: str) -> str
@@ -80,6 +91,29 @@ entry has `description`, `carrier_code`, `status_code`, `status_label`, `trackin
 (event/date/location of the most recent scan, or `null`). `filter_mode` is `active`
 (in-progress only, the default) or `recent` (also includes recently delivered); it falls
 back to `DEFAULT_FILTER_MODE` when omitted.
+
+```
+add_delivery(tracking_number: str, carrier_code: str, description: str,
+             language?: str = "en", send_push_confirmation?: bool = false) -> str
+```
+
+Adds a package to Parcel tracking (`POST /add-delivery/`). Look up `carrier_code` with
+`get_supported_carriers` first. `language` is an ISO 639-1 code for Parcel's tracking
+updates; `send_push_confirmation` asks Parcel to push a confirmation. Refused when
+`READ_ONLY=true`.
+
+```
+get_supported_carriers() -> str
+```
+
+Returns Parcel's supported-carrier list (codes + names) as JSON. Public endpoint — no API
+key required.
+
+```
+get_delivery_status_codes() -> str
+```
+
+Returns the `status_code` → label map as JSON, without calling the API.
 
 `status_code` maps to `status_label` as: `0` Delivered · `1` Frozen · `2` In transit ·
 `3` Awaiting pickup · `4` Out for delivery · `5` Not found · `6` Failed attempt ·
