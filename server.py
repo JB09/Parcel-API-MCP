@@ -21,6 +21,7 @@ import os
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 
@@ -205,10 +206,26 @@ def _summarize_delivery(delivery: dict) -> dict:
     }
 
 
+# Tool annotations. Clients (e.g. Claude's connector settings) use these hints to
+# group tools as read vs write and to decide what warrants confirmation, so every
+# tool declares them. Named READ (not READ_ONLY) on purpose: a `READ_ONLY`
+# constant would shadow the READ_ONLY env-var boolean above, which
+# _require_writable() reads at call time — silently disabling add_delivery.
+READ = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
+# get_delivery_status_codes is a purely local reference — it makes no external
+# call — so it is read-only with openWorldHint false.
+READ_LOCAL = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
+# Adding a delivery creates a new tracked item without altering existing ones, and
+# each call makes another — not destructive, not idempotent.
+CREATE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True
+)
+
+
 # --- Read tools ---------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def get_deliveries(filter_mode: str | None = None) -> str:
     """List tracked package deliveries from Parcel (parcel.app).
 
@@ -231,7 +248,7 @@ def get_deliveries(filter_mode: str | None = None) -> str:
     return json.dumps(summaries)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def get_supported_carriers() -> str:
     """List the carriers Parcel can track, with their `carrier_code` values.
 
@@ -245,7 +262,7 @@ def get_supported_carriers() -> str:
     return json.dumps(_fetch_carriers())
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_LOCAL)
 def get_delivery_status_codes() -> str:
     """Return the mapping from Parcel `status_code` integers to human labels.
 
@@ -262,7 +279,7 @@ def get_delivery_status_codes() -> str:
 # --- Write tools --------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(annotations=CREATE)
 def add_delivery(
     tracking_number: str,
     carrier_code: str,
