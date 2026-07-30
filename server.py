@@ -19,8 +19,9 @@ import json
 import logging
 import os
 
-import httpx
-from mcp.server.fastmcp import FastMCP
+import httpx2
+from mcp.server.mcpserver import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
@@ -81,6 +82,23 @@ STARTUP_TEST = os.environ.get("STARTUP_TEST", "false").lower() == "true"
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8080"))
 
+# --- DNS-rebinding guard (MCP SDK 2.x) ---
+# SDK 2.x turns the Host-header check on by default (CVE-2025-66416). The allowlist
+# must name the Host the app actually RECEIVES, which behind a proxy is usually the
+# upstream address (`parcel-mcp:8080`), not the public route name — most proxies,
+# Pomerium included, rewrite Host to the upstream unless told to preserve it. A
+# mismatch answers every /mcp call with 421 while /healthz still returns 200, so the
+# container looks healthy. See README.
+# Comma-separated; entries match literally, so use `host:*` to allow any port.
+ALLOWED_HOSTS = [
+    h.strip() for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()
+]
+# Optional Origin allowlist. Defaults to https://<each allowed host>. An absent
+# Origin header always passes (server-to-server calls do not send one).
+ALLOWED_ORIGINS = [
+    o.strip() for o in os.environ.get("MCP_ALLOWED_ORIGINS", "").split(",") if o.strip()
+]
+
 # Parcel's integer `status_code` -> human-readable label. See the Parcel API docs:
 # https://parcelapp.net/help/api-view-deliveries.html
 STATUS_LABELS = {
@@ -95,7 +113,35 @@ STATUS_LABELS = {
     8: "Info received",
 }
 
-mcp = FastMCP("parcel-mcp", host=HOST, port=PORT)
+# SDK 2.x takes host/port on run()/streamable_http_app(), not the constructor.
+# Passing them here would be silently ignored and the server would bind 127.0.0.1:8000.
+mcp = MCPServer("parcel-mcp")
+
+
+def _transport_security() -> TransportSecuritySettings:
+    """Build the DNS-rebinding settings for the streamable-HTTP transport.
+
+    Always returns an explicit object: the SDK only auto-installs its (localhost-only)
+    allowlist when `host` is loopback, and this server binds 0.0.0.0, so leaving it
+    None would mean no Host check at all.
+
+    With MCP_ALLOWED_HOSTS empty the guard is off with a warning — 1.x behaviour, so
+    an SDK bump alone cannot take a working deployment offline. You opt in.
+    """
+    if not ALLOWED_HOSTS:
+        logger.warning(
+            "MCP_ALLOWED_HOSTS not set — DNS-rebinding guard DISABLED. The "
+            "authorization proxy is then the only check on the Host header. Set it to "
+            "the Host the app receives (see the proxy log; often the upstream address, "
+            "e.g. parcel-mcp:8080)."
+        )
+        return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    logger.info("DNS-rebinding guard enabled — allowed hosts: %s", ", ".join(ALLOWED_HOSTS))
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=ALLOWED_HOSTS,
+        allowed_origins=ALLOWED_ORIGINS or [f"https://{h}" for h in ALLOWED_HOSTS],
+    )
 
 
 def _require_key() -> None:
@@ -131,10 +177,10 @@ def _fetch_deliveries(filter_mode: str) -> list:
     """Call the Parcel API and return the raw `deliveries` list.
 
     Raises RuntimeError when the key is missing (before any network I/O) or when
-    Parcel reports `success: false`; httpx raises on HTTP/transport errors.
+    Parcel reports `success: false`; httpx2 raises on HTTP/transport errors.
     """
     _require_key()
-    with httpx.Client(timeout=PARCEL_TIMEOUT) as client:
+    with httpx2.Client(timeout=PARCEL_TIMEOUT) as client:
         resp = client.get(
             DELIVERIES_URL,
             params={"filter_mode": filter_mode},
@@ -150,10 +196,10 @@ def _post_delivery(payload: dict) -> dict:
     """POST a new delivery to Parcel and return the parsed response.
 
     Raises RuntimeError when the key is missing or Parcel reports `success: false`;
-    httpx raises on HTTP/transport errors.
+    httpx2 raises on HTTP/transport errors.
     """
     _require_key()
-    with httpx.Client(timeout=PARCEL_TIMEOUT) as client:
+    with httpx2.Client(timeout=PARCEL_TIMEOUT) as client:
         resp = client.post(
             ADD_DELIVERY_URL,
             json=payload,
@@ -167,7 +213,7 @@ def _post_delivery(payload: dict) -> dict:
 
 def _fetch_carriers() -> object:
     """Fetch Parcel's public supported-carriers list (no API key required)."""
-    with httpx.Client(timeout=PARCEL_TIMEOUT) as client:
+    with httpx2.Client(timeout=PARCEL_TIMEOUT) as client:
         resp = client.get(CARRIERS_URL)
         resp.raise_for_status()
         return resp.json()
@@ -397,7 +443,9 @@ def _run_with_identity_gate() -> None:
     from starlette.concurrency import run_in_threadpool
     from starlette.middleware.base import BaseHTTPMiddleware
 
-    app = mcp.streamable_http_app()
+    # `host` and `transport_security` must be passed here too — this path builds the
+    # ASGI app itself, so it does not inherit anything from mcp.run().
+    app = mcp.streamable_http_app(host=HOST, transport_security=_transport_security())
 
     async def require_identity(request: Request, call_next):
         if request.url.path.startswith("/mcp"):
@@ -445,4 +493,9 @@ if __name__ == "__main__":
             raise SystemExit(1)
         _run_with_identity_gate()
     else:
-        mcp.run(transport="streamable-http")
+        mcp.run(
+            transport="streamable-http",
+            host=HOST,
+            port=PORT,
+            transport_security=_transport_security(),
+        )

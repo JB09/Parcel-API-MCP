@@ -46,13 +46,37 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha
 
-      - name: Build and push
+      # Build into the local daemon first so the smoke test can run against the
+      # exact image that will be pushed. `docker build` succeeding proves very
+      # little here: a server bound to the wrong interface, or a Host allowlist
+      # that rejects the proxy, both produce an image that builds and a container
+      # that reports healthy while every tool call fails.
+      - name: Build image (load locally, no push)
         uses: docker/build-push-action@v7
         with:
           context: .
-          # Push everywhere except PRs, where we only validate that the image builds.
-          push: ${{ github.event_name != 'pull_request' }}
+          load: true
+          push: false
           # Refresh everything on the weekly scheduled rebuild.
           no-cache: ${{ github.event_name == 'schedule' }}
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: parcel-mcp:smoke-test
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Smoke test
+        env:
+          IMAGE: parcel-mcp:smoke-test
+        run: ./scripts/smoke_test.sh
+
+      # Retag and push the image the smoke test just passed, rather than
+      # rebuilding — what ships is byte-for-byte what was tested.
+      - name: Push tested image
+        if: github.event_name != 'pull_request'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          echo "$TAGS" | while read -r tag; do
+            [ -n "$tag" ] || continue
+            docker tag parcel-mcp:smoke-test "$tag"
+            docker push "$tag"
+          done

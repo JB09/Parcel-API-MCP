@@ -70,6 +70,8 @@ published container image can safely be public.
 | `POMERIUM_AUDIENCE` | — | Expected `aud` claim (the route host/URL). Verified when set — strongly recommended. |
 | `POMERIUM_ISSUER` | — | Expected `iss` claim. Verified only when set. |
 | `POMERIUM_IDENTITY_HEADER` | `x-pomerium-assertion,x-pomerium-jwt-assertion` | Comma-separated header(s) carrying the assertion JWT. |
+| `MCP_ALLOWED_HOSTS` | — (guard off) | Comma-separated `Host` allowlist for `/mcp` (DNS-rebinding guard). Empty disables the guard, with a warning at startup. See below — this is **not** your public hostname. |
+| `MCP_ALLOWED_ORIGINS` | `https://<each allowed host>` | Comma-separated `Origin` allowlist. Requests with no `Origin` header always pass. |
 | `HOST` / `PORT` | `0.0.0.0` / `8080` | Server bind address/port. |
 
 ### Getting a Parcel API key
@@ -118,6 +120,58 @@ Returns the `status_code` → label map as JSON, without calling the API.
 `status_code` maps to `status_label` as: `0` Delivered · `1` Frozen · `2` In transit ·
 `3` Awaiting pickup · `4` Out for delivery · `5` Not found · `6` Failed attempt ·
 `7` Exception · `8` Info received.
+
+## DNS-rebinding guard (`MCP_ALLOWED_HOSTS`)
+
+The MCP SDK checks the `Host` header on `/mcp` and answers `421 Misdirected Request`
+when it is not on the allowlist ([CVE-2025-66416](https://advisories.gitlab.com/pypi/mcp/CVE-2025-66416/)).
+This server leaves the guard **off** unless `MCP_ALLOWED_HOSTS` is set, so it is
+something you opt into rather than something an upgrade can switch on under you. The
+startup log always says which way it went:
+
+```
+DNS-rebinding guard enabled — allowed hosts: parcel-mcp:8080
+INFO:     Uvicorn running on http://0.0.0.0:8080
+```
+
+### ⚠️ The allowlist is not your public hostname
+
+Most reverse proxies — Pomerium included — **rewrite `Host` to the upstream address**
+before forwarding. The public route may be `https://parcel-mcp.example.com`, but what
+the container actually receives is `Host: parcel-mcp:8080`. Setting
+`MCP_ALLOWED_HOSTS=parcel-mcp.example.com` therefore still `421`s every call.
+
+**Don't guess — read it off the proxy.** In Pomerium's access log, the `authority`
+field on the `http-request` line is the `Host` the upstream sees:
+
+```json
+{"upstream-cluster":"parcel-mcp-...","authority":"parcel-mcp:8080",
+ "path":"/mcp","response-code":200}
+```
+
+Whether the Host is preserved or rewritten varies **per route**, so check this route
+specifically. Then either allowlist what arrives (`MCP_ALLOWED_HOSTS=parcel-mcp:8080`)
+or set `preserve_host_header: true` on the Pomerium route and allowlist the public
+name. Matching is literal: a bare `parcel-mcp` will not match a `Host` carrying a
+port — use `parcel-mcp:*` to allow any port.
+
+This misconfiguration is invisible from the outside: the guard only covers `/mcp`, so
+`/healthz` keeps returning 200 and Docker keeps reporting the container **healthy**
+while every tool call fails. `docker compose logs parcel-mcp | grep "Invalid Host"` is
+the tell — and `scripts/smoke_test.sh` (below) asserts both directions in CI.
+
+## Smoke test
+
+```sh
+IMAGE=ghcr.io/jb09/parcel-api-mcp:latest scripts/smoke_test.sh
+```
+
+Starts the image and drives a real MCP `initialize` → `tools/list` → `tools/call`
+over a non-localhost `Host`, then asserts the rebinding guard returns 200 for an
+allowed `Host` and 421 for a foreign one, and that the image's TLS trust store is
+populated. No Parcel API key is required — the handshake and
+`get_delivery_status_codes` are entirely local, so it never spends the Parcel API's
+20 requests/hour. CI runs it against the built image **before** pushing to GHCR.
 
 ## Enabling app-layer verification
 
@@ -173,6 +227,11 @@ docker compose exec parcel-mcp \
 # -> b'ok'
 ```
 
+A green health check proves only that the process is up — it does not go through
+`/mcp`, so it stays 200 even when every tool call is being rejected. Confirm the real
+path with a tool call from your MCP client, or run `scripts/smoke_test.sh` against the
+image.
+
 Then add the `parcel-mcp` route to your authorization proxy (pathless upstream, e.g.
 `to: http://parcel-mcp:8080`, so the `/mcp` path passes through) and connect your MCP
 client to `https://<your-host>/mcp`.
@@ -184,10 +243,12 @@ Patches flow with near-zero manual effort:
 - **Dependabot** (`.github/dependabot.yml`) watches `requirements.txt`, the Dockerfile base
   image, and the workflow's actions, opening upgrade PRs weekly. Also enable Dependabot
   **security updates** in the repo's Settings → Code security.
-- **CI** (`.github/workflows/build.yml`) builds and pushes the image to GHCR on push to
-  `main`, on Dependabot PRs, via manual dispatch, and **weekly (Mon 06:00 UTC) with
-  `no-cache`** so the OS and Python patches are genuinely refreshed even without code
-  changes.
+- **CI** (`.github/workflows/build.yml`) builds the image, runs `scripts/smoke_test.sh`
+  against it, and only then pushes it to GHCR — on push to `main`, on Dependabot PRs
+  (build + smoke test only, no push), via manual dispatch, and **weekly (Mon 06:00 UTC)
+  with `no-cache`** so the OS and Python patches are genuinely refreshed even without
+  code changes. The pushed image is the retagged one the smoke test passed, so what
+  ships is exactly what was tested.
 - On the host, pull the rebuilt image with [Watchtower](https://containrrr.dev/watchtower/)
   (the compose file already sets the opt-in label) or a cron running
   `docker compose pull && docker compose up -d`.
