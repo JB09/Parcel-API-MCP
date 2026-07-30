@@ -1,7 +1,12 @@
 # Official MCP Python SDK (pulls in starlette + uvicorn used by server.py).
-# Loose lower bound so Dependabot can propose upgrades.
-mcp>=1.28.1
-# HTTP client used to call the Parcel "view deliveries" REST endpoint.
-httpx>=0.28.1
+# The upper bound is deliberate: 2.x renamed the server class and changed the
+# transport defaults, so a major bump is never a drop-in. Review before widening.
+mcp>=2.0.0,<3
+# HTTP client used to call the Parcel REST endpoints. `httpx2` is the client the
+# MCP SDK now ships, so using it keeps a single HTTP stack in the image. It
+# verifies TLS against the system trust store (via truststore) rather than a
+# bundled certifi set, so the base image must provide ca-certificates —
+# python:3.x-slim does, and scripts/smoke_test.sh asserts it.
+httpx2>=2.5.0
 # JWT verification of Pomerium's identity assertion (ES256 needs cryptography).
 pyjwt[crypto]>=2.13.0
