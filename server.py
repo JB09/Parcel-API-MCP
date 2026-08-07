@@ -20,6 +20,7 @@ import logging
 import os
 
 import httpx2
+from mcp.server.caching import CacheHint
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
@@ -113,9 +114,25 @@ STATUS_LABELS = {
     8: "Info received",
 }
 
+# How long (ms) a client may reuse a cached `tools/list` result. The catalog is
+# registered at import time and cannot change while the process runs, so the
+# only thing that invalidates it is a restart on a new image.
+TOOLS_LIST_TTL_MS = int(os.environ.get("TOOLS_LIST_TTL_MS", str(60 * 60 * 1000)))
+
 # SDK 2.x takes host/port on run()/streamable_http_app(), not the constructor.
 # Passing them here would be silently ignored and the server would bind 127.0.0.1:8000.
-mcp = MCPServer("parcel-mcp")
+mcp = MCPServer(
+    "parcel-mcp",
+    title="Parcel Tracking",
+    website_url="https://github.com/JB09/Parcel-API-MCP",
+    # `cacheScope: public` (MCP 2026-07-28) says a cached result may be shared
+    # across authorization contexts. That holds here — the catalog is static and
+    # identical for every caller (READ_ONLY gates *execution* in
+    # _require_writable(), it does not hide tools from `tools/list`), so no
+    # identity-specific data can leak through a shared cache entry. If a tool is
+    # ever registered conditionally on who is asking, this must become "private".
+    cache_hints={"tools/list": CacheHint(ttl_ms=TOOLS_LIST_TTL_MS, scope="public")},
+)
 
 
 def _transport_security() -> TransportSecuritySettings:

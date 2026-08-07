@@ -152,4 +152,65 @@ assert n, f"empty trust store: {ssl.get_default_verify_paths()}"
 print(f"  ok: {n} CA certificates in the system trust store")
 ' || fail "TLS trust store check failed — does the base image still ship ca-certificates?"
 
+echo "==> Phase 4: modern stateless request path (MCP-Protocol-Version: 2026-07-28)"
+# Phases 1-2 drive the *legacy* protocol: an `initialize` handshake and the
+# Mcp-Session-Id it returns. The SDK picks the era per request from the
+# MCP-Protocol-Version header, so a 2026-07-28 client takes a different code
+# path entirely — one self-contained POST, no handshake, no session. Nothing
+# above touches it, so an SDK bump could break every modern client while CI
+# stays green. Needs its own container: phase 3 used `docker run --rm` and left
+# none running.
+start_container -e "MCP_ALLOWED_HOSTS=${ROUTE_HOST}"
+
+MODERN_VERSION="2026-07-28"
+# With no handshake, what `initialize` used to establish rides on every request
+# in a params._meta envelope instead. All three keys are required — omit them
+# and the server answers 400 (-32602).
+MODERN_META='"_meta":{'
+MODERN_META+='"io.modelcontextprotocol/protocolVersion":"'"$MODERN_VERSION"'",'
+MODERN_META+='"io.modelcontextprotocol/clientCapabilities":{},'
+MODERN_META+='"io.modelcontextprotocol/clientInfo":{"name":"smoke-test","version":"0"}}'
+
+# mcp_post pins the legacy PROTOCOL_VERSION and takes a session rather than
+# arbitrary headers; the modern path needs the routing headers instead.
+mcp_post_modern() {
+  local host="$1" method="$2" body="$3"
+  curl -sS -o "$WORK/b" -D "$WORK/h" -w '%{http_code}' -X POST "$URL" \
+    -H "Host: ${host}" -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' \
+    -H "MCP-Protocol-Version: ${MODERN_VERSION}" \
+    -H "Mcp-Method: ${method}" \
+    --data-binary "$body"
+}
+
+code="$(mcp_post_modern "$ROUTE_HOST" "tools/list" \
+  "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{${MODERN_META}}}")"
+[ "$code" = "200" ] || fail "sessionless tools/list returned $code (want 200): $(cat "$WORK/b")"
+
+for tool in $EXPECTED_TOOLS; do
+  grep -q "\"$tool\"" "$WORK/b" \
+    || fail "tool '$tool' missing from the modern tools/list: $(cat "$WORK/b")"
+done
+
+# The point of the modern path is that there is no protocol session to store; a
+# session id coming back means the request fell through to the legacy handler.
+[ -z "$(session_id)" ] \
+  || fail "modern request returned an mcp-session-id — it was served by the legacy path"
+ok "sessionless tools/list 200, all $(wc -w <<<"$EXPECTED_TOOLS") tools, no session"
+
+# server.py declares a cache hint for tools/list; a client that never sees it
+# silently re-fetches the catalog on every reconnect.
+grep -q '"ttlMs"' "$WORK/b" && grep -q '"cacheScope":"public"' "$WORK/b" \
+  || fail "modern tools/list is missing ttlMs/cacheScope: $(cat "$WORK/b")"
+ok "tools/list carries the cache hint"
+
+# 2026-07-28 requires Mcp-Method (and Mcp-Name) to mirror the body so gateways
+# can route on headers alone; the SDK rejects a mismatch with -32020. That
+# guarantee is what makes per-tool policy at the proxy safe to write.
+code="$(mcp_post_modern "$ROUTE_HOST" "tools/list" \
+  "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"get_supported_carriers\",\"arguments\":{},${MODERN_META}}}")"
+[ "$code" = "400" ] || fail "header/body mismatch returned $code (want 400): $(cat "$WORK/b")"
+grep -q '\-32020' "$WORK/b" || fail "expected HEADER_MISMATCH (-32020): $(cat "$WORK/b")"
+ok "header/body agreement enforced"
+
 echo "PASS: smoke test green against ${IMAGE}"
