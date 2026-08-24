@@ -45,6 +45,26 @@ trap 'docker rm -f "$CONTAINER" >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
 fail() { echo "FAIL: $*" >&2; echo "--- container log ---" >&2; docker logs "$CONTAINER" 2>&1 | tail -40 >&2; exit 1; }
 ok()   { echo "  ok: $*"; }
 
+# Wait for a line to appear in the container log. Returns 1 if it never does.
+#
+# The app writes these lines before uvicorn binds, so by the time /healthz
+# answers they have certainly been *written* — but the daemon's log pipeline
+# lags by a few milliseconds, and a single `docker logs | grep` loses that race
+# on a loaded runner. It did in smtp-mcp-wrapper's weekly rebuild on 2026-08-24:
+# the guard grep missed a line the failure dump printed 12ms later, in a run
+# whose behavioural checks proved the guard was working. Since fail() exits, a
+# lost race here aborts the run and takes every later phase with it. Polling
+# keeps the assertion honest — a line that genuinely never appears still fails,
+# just at the timeout instead of instantly.
+wait_for_log() {
+  local pattern="$1" deadline=$((SECONDS + ${2:-10}))
+  while :; do
+    if docker logs "$CONTAINER" 2>&1 | grep -q -- "$pattern"; then return 0; fi
+    if [ "$SECONDS" -ge "$deadline" ]; then return 1; fi
+    sleep 0.2
+  done
+}
+
 # Start the container fresh. Extra args become `docker run -e` flags.
 start_container() {
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
@@ -89,7 +109,7 @@ echo "==> Phase 1: MCP handshake over a non-localhost Host (guard off)"
 start_container
 # The bind interface is the cheapest possible check, and the failure it catches
 # (127.0.0.1:8000 instead of 0.0.0.0:8080) is otherwise invisible from outside.
-docker logs "$CONTAINER" 2>&1 | grep -q 'Uvicorn running on http://0.0.0.0:8080' \
+wait_for_log 'Uvicorn running on http://0.0.0.0:8080' \
   || fail "server did not bind 0.0.0.0:8080 — check host=/port= are passed to mcp.run()"
 ok "bound 0.0.0.0:8080"
 
@@ -121,7 +141,7 @@ ok "tools/call get_delivery_status_codes returned the status map"
 
 echo "==> Phase 2: DNS-rebinding guard, both directions"
 start_container -e "MCP_ALLOWED_HOSTS=${ROUTE_HOST}"
-docker logs "$CONTAINER" 2>&1 | grep -q "DNS-rebinding guard enabled — allowed hosts: ${ROUTE_HOST}" \
+wait_for_log "DNS-rebinding guard enabled — allowed hosts: ${ROUTE_HOST}" \
   || fail "startup log does not name the allowlist — did MCP_ALLOWED_HOSTS reach the container?"
 ok "guard enabled for ${ROUTE_HOST}"
 
