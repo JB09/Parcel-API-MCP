@@ -7,6 +7,6 @@ mcp>=2.0.0,<3
 # verifies TLS against the system trust store (via truststore) rather than a
 # bundled certifi set, so the base image must provide ca-certificates —
 # python:3.x-slim does, and scripts/smoke_test.sh asserts it.
-httpx2>=2.10.0
+httpx2>=2.12.0
 # JWT verification of Pomerium's identity assertion (ES256 needs cryptography).
 pyjwt[crypto]>=2.13.0
