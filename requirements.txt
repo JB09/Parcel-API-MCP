@@ -1,7 +1,7 @@
 # Official MCP Python SDK (pulls in starlette + uvicorn used by server.py).
 # The upper bound is deliberate: 2.x renamed the server class and changed the
 # transport defaults, so a major bump is never a drop-in. Review before widening.
-mcp>=2.0.0,<3
+mcp>=2.1.1,<3
 # HTTP client used to call the Parcel REST endpoints. `httpx2` is the client the
 # MCP SDK now ships, so using it keeps a single HTTP stack in the image. It
 # verifies TLS against the system trust store (via truststore) rather than a
