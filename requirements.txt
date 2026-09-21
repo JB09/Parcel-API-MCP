@@ -17,4 +17,4 @@ mcp==2.2.0
 # python:3.x-slim does, and scripts/smoke_test.sh asserts it.
 httpx2>=2.12.0
 # JWT verification of Pomerium's identity assertion (ES256 needs cryptography).
-pyjwt[crypto]>=2.13.0
+pyjwt[crypto]>=2.14.0
