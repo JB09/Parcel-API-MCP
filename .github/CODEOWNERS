@@ -1,0 +1,4 @@
+* @JB09
+
+# Protect this file itself
+/.github/CODEOWNERS @JB09
