@@ -9,7 +9,7 @@
 # An exact pin gives fetch-metadata a clean previous/new pair, so patch and
 # minor bumps auto-merge again while a 3.0.0 still classifies as major and
 # stays manual — same protection, correct classification.
-mcp==2.2.0
+mcp==2.3.0
 # HTTP client used to call the Parcel REST endpoints. `httpx2` is the client the
 # MCP SDK now ships, so using it keeps a single HTTP stack in the image. It
 # verifies TLS against the system trust store (via truststore) rather than a
